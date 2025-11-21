@@ -16,7 +16,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 MONGO_URI = os.getenv("MONGO_CONNECTION_STRING")
-DB_NAME = os.getenv("DB_TENDER_BHARAT")
+DB_NAME = os.getenv("DB_TENDER_BHARAT") or "TenderBharat"
 TENDERS_COLLECTION = os.getenv("TENDERS_COLLECTION_NAME") or "Tenders"
 VECTOR_COLLECTION = os.getenv("VECTOR_COLLECTION_NAME") or "TenderDocs"
 

@@ -1,22 +1,26 @@
+import asyncio
 import json
 import os
 
-import pika
+import aio_pika
 import psycopg2
+from aio_pika.abc import AbstractIncomingMessage
 
 from processor import process_single_tender
 from utils.config import RABBIT_URL
 
 POSTGRES_DSN = os.getenv("POSTGRES_CONN_STRING")
+MAX_ATTEMPTS = 5  # keep synced with your Go maxAttempts constant
 
 
 def connect_db():
+    # Consider replacing with a connection pool for higher throughput.
     return psycopg2.connect(POSTGRES_DSN)
 
 
 def claim_job(conn, job_id):
     """
-    Atomically claim a job.
+    Atomically claim a job. Returns tuple (payload_json, attempts) or None.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -31,6 +35,19 @@ def claim_job(conn, job_id):
         row = cur.fetchone()
         conn.commit()
         return row  # None if not claimable
+
+
+def reset_job_to_pending(conn, job_id):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+            SET status='pending_python', updated_at=NOW()
+            WHERE id=%s
+        """,
+            (job_id,),
+        )
+        conn.commit()
 
 
 def complete_job(conn, job_id, python_result):
@@ -63,49 +80,83 @@ def fail_job(conn, job_id, error_msg):
         conn.commit()
 
 
-async def on_message(ch, method, properties, body):
-    job_msg = json.loads(body)
-    job_id = job_msg["job_id"]
+async def on_message(message: AbstractIncomingMessage):
+    """
+    NOTE: we use message.process() context manager which will ACK the message if the block
+    exits normally and will NACK (requeue) if an exception is raised. To get correct retry
+    behaviour we handle DB state explicitly inside the block and re-raise when we want the
+    broker to retry the message.
+    """
+    async with message.process():
+        job_msg = json.loads(message.body)
+        job_id = job_msg["job_id"]
 
-    # print("RAW MESSAGE BODY:", body)
-    # print("PARSED:", job_msg)
-    # print("JOB ID TYPE:", type(job_id))
+        conn = connect_db()
+        claimed = claim_job(conn, job_id)
 
-    conn = connect_db()
+        if not claimed:
+            conn.close()
+            # Nothing to do: job not pending_python, just ack and drop
+            return
 
-    # claim job
-    claimed = claim_job(conn, job_id)
-    if not claimed:
-        ch.basic_ack(method.delivery_tag)
-        return
+        payload_json, attempts = claimed
 
-    payload_json, attempts = claimed
-    payload = payload_json
+        # Payload from Postgres may be a string (JSON). Ensure we have a dict.
+        if isinstance(payload_json, (bytes, str)):
+            try:
+                payload = json.loads(payload_json)
+            except Exception:
+                # invalid payload stored in DB: mark job failed and ack message
+                fail_job(conn, job_id, "invalid payload JSON")
+                conn.close()
+                return
+        else:
+            payload = payload_json
 
-    try:
-        # DO THE PYTHON LOGIC
-        python_result = await process_single_tender(payload)
-        complete_job(conn, job_id, python_result)
-        ch.basic_ack(method.delivery_tag)
-    except Exception as e:
-        fail_job(conn, job_id, str(e))
-        ch.basic_ack(method.delivery_tag)
+        try:
+            # process_single_tender can perform blocking work; ensure it runs without blocking the event loop
+            python_result = await process_single_tender(payload)
+            complete_job(conn, job_id, python_result)
 
-    conn.close()
+            print(f"[python-worker] DONE job_id={job_id}")
+
+            conn.close()
+            return
+
+        except Exception as e:
+            # Decide whether to permanently fail or requeue for retry
+            err_str = str(e)
+            if attempts >= MAX_ATTEMPTS:
+                # mark failed and ACK (by returning without raising)
+                fail_job(conn, job_id, err_str)
+                conn.close()
+                return
+            else:
+                # reset job state to pending_python so the message will be claimable again
+                # then re-raise to NACK and allow RabbitMQ to redeliver after its retry/backoff
+                try:
+                    reset_job_to_pending(conn, job_id)
+                finally:
+                    conn.close()
+                # Re-raise so aio_pika will NACK the message and broker can redeliver
+                raise
 
 
-def start_worker():
-    print(RABBIT_URL)
-    connection = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
-    channel = connection.channel()
+async def start_worker():
+    print("Connecting to RabbitMQ...")
+    connection = await aio_pika.connect_robust(RABBIT_URL)
 
-    channel.queue_declare(queue="jobs.python", durable=True)
-    channel.basic_qos(prefetch_count=1)
-    channel.basic_consume(queue="jobs.python", on_message_callback=on_message)
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=1)
 
-    print("Python worker started. Waiting for messages...")
-    channel.start_consuming()
+    queue = await channel.declare_queue("jobs.python", durable=True)
+
+    print("Python async worker started. Waiting for messages...")
+    await queue.consume(on_message)
+
+    # Keep the worker alive forever
+    await asyncio.Future()
 
 
 if __name__ == "__main__":
-    start_worker()
+    asyncio.run(start_worker())
