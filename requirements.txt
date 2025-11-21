@@ -1,0 +1,12 @@
+dotenv==0.9.9
+fastapi==0.120.0
+pdfplumber==0.11.8
+boto3==1.40.59
+motor==3.7.1
+pydantic==2.12.3
+pydantic_core==2.41.4
+typer==0.20.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+sentence-transformers==5.1.2
+psutil==7.1.1
