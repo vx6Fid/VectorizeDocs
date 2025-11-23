@@ -44,3 +44,4 @@ You are a translator. Translate the following text to English exactly.
 """
 
 RABBIT_URL = os.getenv("RABBITMQ_URL")
+GPU_SERVER_URL = os.getenv("GPU_SERVER_URL", "http://127.0.0.1:9000")

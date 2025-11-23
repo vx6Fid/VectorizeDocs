@@ -1,13 +1,17 @@
+# processor.py
 import asyncio
 import gc
 import logging
 import os
 import traceback
-from typing import Any, Dict, List
+from io import BytesIO
+from typing import Any
 
-from gpu_embedder import embed_chunks
+import pdfplumber
+
+from gpu_worker import embedding_queue
 from utils.mongo_utils import vector_collection
-from utils.pdf_processing import process_pdf
+from utils.pdf_processing import process_pdf_batch
 from utils.s3_utils import fetch_pdf, list_s3_pdfs
 
 # Configure logging with timestamps and level
@@ -46,158 +50,188 @@ async def process_single_tender(payload: dict[str, Any]) -> dict[str, Any]:
         document_name = os.path.basename(pdf_key)
         logger.debug("Processing pdf_key=%s document_name=%s", pdf_key, document_name)
 
-        # Count documents in Mongo in a thread to avoid blocking the event loop
+        # === Mongo semantics: check for document_complete ===
         try:
-            logger.debug(
-                "Checking for existing documents in Mongo for %s / %s",
-                tender_id,
-                document_name,
-            )
-            exists = await asyncio.to_thread(
-                lambda: vector_collection.count_documents(
-                    {"tender_id": tender_id, "document_name": document_name}
+            # Check if this document is already marked complete
+            complete_doc = await asyncio.to_thread(
+                lambda: vector_collection.find_one(
+                    {
+                        "tender_id": tender_id,
+                        "document_name": document_name,
+                        "document_complete": True,
+                    }
                 )
             )
-            logger.debug("Mongo count for %s: %s", document_name, exists)
-            if exists > 0:
+
+            if complete_doc:
+                logger.info("Skipping %s because document_complete=True", document_name)
                 result["skipped_docs"] += 1
-                logger.info(
-                    "Skipping %s because it already exists in Mongo", document_name
-                )
                 continue
+
+            # Remove any partial embeddings (if present)
+            logger.info("Removing partial embeddings for %s (if any)", document_name)
+            await asyncio.to_thread(
+                vector_collection.delete_many,
+                {"tender_id": tender_id, "document_name": document_name},
+            )
         except Exception as e:
             tb = traceback.format_exc()
-            logger.exception("Error checking Mongo for %s: %s", document_name, e)
-            result["errors"].append(f"mongo_count_{document_name}: {str(e)}\n{tb}")
+            logger.exception(
+                "Error checking/cleaning Mongo for %s: %s", document_name, e
+            )
+            result["errors"].append(f"mongo_check_{document_name}: {str(e)}\n{tb}")
             # continue to next pdf rather than fail everything
             continue
 
+        # === Fetch PDF bytes ===
         try:
             logger.debug("Fetching PDF from S3: %s", pdf_key)
             pdf_stream = await fetch_pdf(pdf_key)
-            logger.info("Fetched PDF %s (type=%s)", document_name, type(pdf_stream))
+            pdf_bytes = pdf_stream.read()
+            logger.info("Fetched PDF %s size=%d bytes", document_name, len(pdf_bytes))
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.exception("Failed to fetch PDF %s: %s", document_name, e)
+            result["errors"].append(f"fetch_{document_name}: {str(e)}\n{tb}")
+            continue
 
-            # process_pdf contains blocking PDF parsing; run it in a separate thread/process
-            # IMPORTANT: don't call asyncio.run from within an existing event loop / thread
-            logger.debug("Calling process_pdf in a thread for %s", document_name)
-            pdf_result = await asyncio.to_thread(process_pdf, pdf_stream)
-            logger.info("process_pdf finished for %s", document_name)
-
-            # Validate pdf_result structure
-            if not isinstance(pdf_result, dict):
-                raise TypeError(f"process_pdf returned non-dict: {type(pdf_result)}")
-
-            chunks: List[Dict[str, Any]] = pdf_result.get("chunks", [])
-            logger.debug(
-                "pdf_result contains %d chunks for %s", len(chunks), document_name
+        # === Determine total pages using pdfplumber ===
+        try:
+            total_pages = await asyncio.to_thread(
+                lambda: len(pdfplumber.open(BytesIO(pdf_bytes)).pages)
             )
-
-            scanned_pages = pdf_result.get("scanned_pages", 0)
-            regular_pages = pdf_result.get("regular_pages", 0)
-            result["scanned_pages"] += scanned_pages
-            result["regular_pages"] += regular_pages
-            logger.info(
-                "Pages for %s -> scanned: %s, regular: %s",
-                document_name,
-                scanned_pages,
-                regular_pages,
-            )
-
-            if not chunks:
+            logger.info("%s total_pages=%d", document_name, total_pages)
+            if total_pages == 0:
+                logger.warning(
+                    "Empty PDF %s, marking empty and skipping", document_name
+                )
                 result["empty_docs"] += 1
-                logger.warning("No chunks extracted for %s", document_name)
-                continue
-
-            # Print a sample of the first chunk keys / text length to debug schema mismatch
-            try:
-                first = chunks[0]
-                logger.debug("First chunk keys: %s", list(first.keys()))
-                sample_text = (
-                    first.get("text") or first.get("data") or "<no-text-field>"
-                )
-                logger.debug(
-                    "First chunk sample length: %d",
-                    len(sample_text) if isinstance(sample_text, str) else -1,
-                )
-            except Exception:
-                logger.exception("Failed to inspect first chunk for %s", document_name)
-
-            # Run embedding in a thread so heavy CPU/GPU work does not block the loop.
-            # If you have a GPU embedder (external) use it; otherwise use local embed_chunks below.
-            try:
-                logger.debug(
-                    "Starting embedding for %s with %d chunks",
-                    document_name,
-                    len(chunks),
-                )
-                # If you have an external GPU embedder function, use it; otherwise fallback to local embed_chunks
-                # We call it in a thread to avoid blocking
-                embeddings = await asyncio.to_thread(embed_chunks, chunks)
-                logger.info(
-                    "Embedding finished for %s: received %d embeddings",
-                    document_name,
-                    len(embeddings),
-                )
-            except Exception as e:
-                tb = traceback.format_exc()
-                logger.exception("Embedding failed for %s: %s", document_name, e)
-                result["errors"].append(f"embed_{document_name}: {str(e)}\n{tb}")
-                continue
-
-            # Build docs for Mongo insert
-            docs = []
-            try:
-                for c, emb in zip(chunks, embeddings):
-                    # If embedding returns dicts (like our embed_chunks below), handle both shapes
-                    if isinstance(emb, dict) and "embedding" in emb:
-                        embedding_vector = emb["embedding"]
-                    else:
-                        embedding_vector = emb
-
-                    doc = {
-                        "tender_id": tender_id,
-                        "document_name": document_name,
-                        "text": c.get("text") or c.get("data") or "",
-                        "embedding": embedding_vector.tolist()
-                        if hasattr(embedding_vector, "tolist")
-                        else embedding_vector,
-                        # preserve chunk metadata if present:
-                        "chunk_meta": {
-                            "page": c.get("page"),
-                            "position": c.get("position"),
-                            "sub_position": c.get("sub_position"),
-                            "type": c.get("type"),
-                            "is_scanned": c.get("is_scanned"),
-                        },
-                    }
-                    docs.append(doc)
-                logger.debug(
-                    "Prepared %d docs for Mongo insert for %s", len(docs), document_name
-                )
-            except Exception as e:
-                tb = traceback.format_exc()
-                logger.exception(
-                    "Failed to prepare docs for insert for %s: %s", document_name, e
-                )
-                result["errors"].append(f"prepare_docs_{document_name}: {str(e)}\n{tb}")
-                continue
-
-            # Insert into Mongo in a thread
-            try:
-                if docs:
-                    logger.debug(
-                        "Inserting %d docs into Mongo for %s", len(docs), document_name
+                # mark empty PDF as complete so we don't reprocess forever
+                try:
+                    await asyncio.to_thread(
+                        lambda: vector_collection.update_one(
+                            {"tender_id": tender_id, "document_name": document_name},
+                            {"$set": {"document_complete": True}},
+                            upsert=True,
+                        )
                     )
-                    await asyncio.to_thread(vector_collection.insert_many, docs)
-                    result["processed_docs"] += 1
-                    logger.info("Inserted docs into Mongo for %s", document_name)
-                else:
-                    logger.warning("No docs to insert for %s", document_name)
-            except Exception as e:
-                tb = traceback.format_exc()
-                logger.exception("Mongo insert failed for %s: %s", document_name, e)
-                result["errors"].append(f"mongo_insert_{document_name}: {str(e)}\n{tb}")
+                except Exception as e2:
+                    tb2 = traceback.format_exc()
+                    logger.exception(
+                        "Failed to mark empty PDF complete %s: %s", document_name, e2
+                    )
+                    result["errors"].append(
+                        f"mark_empty_complete_{document_name}: {str(e2)}\n{tb2}"
+                    )
                 continue
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.exception("Failed to count pages for %s: %s", document_name, e)
+            result["errors"].append(f"pagecount_{document_name}: {str(e)}\n{tb}")
+            continue
+
+        # === Dynamic batch size decision (same rule as embed_server.py) ===
+        try:
+            file_size_kb = len(pdf_bytes) / 1024
+            size_per_page_kb = file_size_kb / max(total_pages, 1)
+            batch_size = 20 if size_per_page_kb < 250 else 5
+            logger.info(
+                "%s dynamic batch_size=%d (size_per_page=%.1f KB)",
+                document_name,
+                batch_size,
+                size_per_page_kb,
+            )
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.exception("Failed computing batch size for %s: %s", document_name, e)
+            result["errors"].append(f"batchsize_{document_name}: {str(e)}\n{tb}")
+            # fallback
+            batch_size = 5
+
+        # === Process by page batches and enqueue to internal GPU worker ===
+        try:
+            for start in range(0, total_pages, batch_size):
+                end = min(start + batch_size, total_pages)
+                is_last = end >= total_pages
+
+                logger.info(
+                    "%s page batch %d -> %d (last=%s)",
+                    document_name,
+                    start,
+                    end,
+                    is_last,
+                )
+
+                # process_pdf_batch is ASYNC → call directly and expect (chunks, scanned, regular)
+                chunks, scanned, regular = await process_pdf_batch(
+                    pdf_bytes, start, end
+                )
+
+                logger.debug(
+                    "   • Chunks = %d | Scanned = %d | Regular = %d",
+                    len(chunks),
+                    scanned,
+                    regular,
+                )
+
+                result["scanned_pages"] += scanned
+                result["regular_pages"] += regular
+
+                if not chunks:
+                    logger.warning(
+                        "No chunks produced for %s batch %d-%d",
+                        document_name,
+                        start,
+                        end,
+                    )
+                    if is_last:
+                        # last batch produced no chunks → treat as empty; mark complete
+                        result["empty_docs"] += 1
+                        try:
+                            await asyncio.to_thread(
+                                lambda: vector_collection.update_one(
+                                    {
+                                        "tender_id": tender_id,
+                                        "document_name": document_name,
+                                    },
+                                    {"$set": {"document_complete": True}},
+                                    upsert=True,
+                                )
+                            )
+                        except Exception as e2:
+                            tb2 = traceback.format_exc()
+                            logger.exception(
+                                "Failed to mark empty final batch complete for %s: %s",
+                                document_name,
+                                e2,
+                            )
+                            result["errors"].append(
+                                f"mark_empty_final_{document_name}: {str(e2)}\n{tb2}"
+                            )
+                    continue
+
+                # ENQUEUE TO INTERNAL GPU WORKER (follows Phase 1 contract)
+                try:
+                    embedding_queue.put((chunks, document_name, tender_id, is_last))
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    logger.exception(
+                        "Failed to enqueue batch for %s: %s", document_name, e
+                    )
+                    result["errors"].append(f"enqueue_{document_name}: {str(e)}\n{tb}")
+                    # continue processing remaining batches (do not abort the whole tender)
+                    continue
+
+                # small cleanup to release memory
+                try:
+                    del chunks
+                    gc.collect()
+                except Exception:
+                    logger.exception("Cleanup failed for %s", document_name)
+
+            # If we reached here, we queued all batches for the document
+            logger.info("Completed queuing document: %s", document_name)
+            result["processed_docs"] += 1
 
         except Exception as e:
             tb = traceback.format_exc()

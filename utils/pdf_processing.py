@@ -31,23 +31,20 @@ async def deepseek_worker(job, semaphore):
         return sub_chunks
 
 
-async def process_pdf(pdf_stream):
-    pdf_bytes = pdf_stream.read()
+async def process_pdf_batch(pdf_bytes, start_page=0, end_page=None):
     all_sub_chunks = []
     scanned_jobs = []
-    total_pages = 0
 
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         total_pages = len(pdf.pages)
-        print(f"Total pages: {total_pages}")
+        if end_page is None or end_page > total_pages:
+            end_page = total_pages
 
-        for i, page in enumerate(pdf.pages):
+        for i in range(start_page, end_page):
+            page = pdf.pages[i]
             scanned = is_scanned_page(page)
-            print(f"\nProcessing Page {i + 1}: {'SCANNED' if scanned else 'TEXT'}")
-
             if scanned:
-                continue
-                # scanned_jobs.append((i, pdf_bytes))
+                scanned_jobs.append((i, pdf_bytes))
             else:
                 elements = extract_page_content(page)
                 positions = elements_to_positions(elements)
@@ -60,27 +57,17 @@ async def process_pdf(pdf_stream):
                         is_scanned=False,
                     )
                     all_sub_chunks.extend(sub_chunks)
-
-    scanned_pages_count = len(scanned_jobs)
-    regular_pages_count = total_pages - scanned_pages_count
+        gc.collect()
 
     groq_results = []
-
     if scanned_jobs:
-        print(
-            f"\nProcessing {scanned_pages_count} scanned pages with Groq in batches of {MAX_PROCESSES_GROQ}"
-        )
         groq_semaphore = asyncio.Semaphore(MAX_PROCESSES_GROQ)
         groq_tasks = [groq_worker(job, groq_semaphore) for job in scanned_jobs]
         groq_results = await asyncio.gather(*groq_tasks)
 
     deepseek_results = []
-
     if groq_results:
         deepseek_jobs = [(res["page"], res["raw_content"]) for res in groq_results]
-        print(
-            f"\nTranslating {len(deepseek_jobs)} pages with DeepSeek using {MAX_PROCESSES_DEEPSEEK} processes"
-        )
         deepseek_semaphore = asyncio.Semaphore(MAX_PROCESSES_DEEPSEEK)
         deepseek_tasks = [
             deepseek_worker(job, deepseek_semaphore) for job in deepseek_jobs
@@ -88,16 +75,11 @@ async def process_pdf(pdf_stream):
         deepseek_results = await asyncio.gather(*deepseek_tasks)
         for sub_chunks in deepseek_results:
             all_sub_chunks.extend(sub_chunks)
+        gc.collect()
 
-    del pdf_bytes, scanned_jobs
-    if "groq_results" in locals():
-        del groq_results
-    if "deepseek_results" in locals():
-        del deepseek_results
     gc.collect()
-
-    return {
-        "chunks": all_sub_chunks,
-        "scanned_pages": scanned_pages_count,
-        "regular_pages": regular_pages_count,
-    }
+    return (
+        all_sub_chunks,
+        len(scanned_jobs),
+        (end_page - start_page - len(scanned_jobs)),
+    )

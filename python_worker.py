@@ -6,6 +6,7 @@ import aio_pika
 import psycopg2
 from aio_pika.abc import AbstractIncomingMessage
 
+from gpu_worker import join_gpu_worker, start_gpu_worker, stop_gpu_worker
 from processor import process_single_tender
 from utils.config import RABBIT_URL
 
@@ -143,6 +144,9 @@ async def on_message(message: AbstractIncomingMessage):
 
 
 async def start_worker():
+    # GPU thread MUST start before RabbitMQ listening
+    gpu_thread = start_gpu_worker()
+
     print("Connecting to RabbitMQ...")
     connection = await aio_pika.connect_robust(RABBIT_URL)
 
@@ -152,10 +156,13 @@ async def start_worker():
     queue = await channel.declare_queue("jobs.python", durable=True)
 
     print("Python async worker started. Waiting for messages...")
-    await queue.consume(on_message)
-
-    # Keep the worker alive forever
-    await asyncio.Future()
+    try:
+        await queue.consume(on_message)
+        await asyncio.Future()
+    finally:
+        # CLEAN SHUTDOWN: stops GPU worker & waits for it
+        stop_gpu_worker()
+        join_gpu_worker(gpu_thread)
 
 
 if __name__ == "__main__":
