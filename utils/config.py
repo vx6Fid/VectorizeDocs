@@ -25,8 +25,9 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 BATCH_SIZE = 512
 
-MAX_PROCESSES_GROQ = 15
-MAX_PROCESSES_DEEPSEEK = 25
+MAX_PROCESSES_GROQ = 5
+MAX_PROCESSES_DEEPSEEK = 10
+PDF_BATCH_SIZE = 20
 
 GROQ_OCR_PROMPT = """
 Extract all text from this scanned page exactly as it appears on the page.
